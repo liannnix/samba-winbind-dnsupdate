@@ -1,9 +1,9 @@
 #!/bin/sh
+# shellcheck disable=SC3040
 set -euo pipefail
 
 # Host name vars
 FQDN_NAME=
-HOST_NAME=
 UPPER_HOST_NAME=
 
 # Temp krb cache vars
@@ -12,68 +12,99 @@ DOMAIN_REALM=
 
 # Update conf
 TTL=3600
-PTR_UPDATE=1
+PTR_UPDATE=0
+
+log() {
+    local log_message=
+    local log_loevel=
+    log_loevel="$1"
+    log_message="$2"
+    [ "$log_loevel" = "ERROR" ] && \
+        echo "[$log_loevel]: $log_message" 1>&2 || \
+        echo "[$log_loevel]: $log_message"
+}
+
+log_warning() {
+    local log_message=
+    log_message="$1"
+    log "WARNING" "$log_message"
+}
+
+log_error() {
+    local log_message=
+    log_message="$1"
+    log "ERROR" "$log_message"
+}
+
+log_info() {
+    local log_message=
+    log_message="$1"
+    log "INFO" "$log_message"
+}
 
 # To uppercase
-upper()
-{
-    echo -n "$1" | tr '[[:lower:]]' '[[:upper:]]'
+upper() {
+    # shellcheck disable=SC3037
+    echo -n "$1" | tr '[:lower:]' '[:upper:]'
 }
 
 # Check net is installed
-check_req()
-{
+check_req() {
+    # TODO: Сделать нормальный вывод в journald
     net --help  >/dev/null 2>&1 || ( echo "Error: net not installed" && exit 1)
 }
 
 # Set tmp cache name for krb
-set_cache_name()
-{
+set_cache_name() {
     TMP_KRB_CCACHE_NAME="$(mktemp)"
     export KRB5CCNAME="$TMP_KRB_CCACHE_NAME"
 }
 
 # Kinit with host cred
-host_kinit()
-{   
+host_kinit() {
     result="$(kinit -k "$UPPER_HOST_NAME"\$@"$DOMAIN_REALM" 2>&1)" || \
                                                      (echo  "$result" && exit 1)
 }
 
-check_exist_ptr_record()
-{   
+check_exist_ptr_record() {
     ptr_record_exist=1
-    out="$(host "$1" | grep -o "NXDOMAIN")" || ret=1
-    if [ "$out" == "NXDOMAIN" ]; then
+    out="$(host "$1" | grep -E -o "NXDOMAIN|no servers could be reached")"
+    if [ "$out" = "NXDOMAIN" ]; then
         ptr_record_exist=0
     fi
 }
 
-check_exist_forward_record()
-{   
-    forward_record_exist=1
-    out="$(host "$1" | grep -o "NXDOMAIN")" || ret=1
-    if [ "$out" == "NXDOMAIN" ]; then
-        forward_record_exist=0
+check_exist_a_record() {
+    local a_record_exist=0
+    local ret=0
+    out="$(host "$1" | grep -E -o "NXDOMAIN|no servers could be reached|has no A record")" || ret=1
+    if [ "$out" = "NXDOMAIN" ] && [ $ret -eq 1 ]; then
+        a_record_exist=1
+        log_info "A record not exists"
+    elif [ "$out" = "no servers could be reached" ] && [ $ret -eq 1 ]; then
+        log_error "Can not connect to DNS servers"
+    elif [ $ret -eq 1 ]; then
+        log_error "DNS error"
+    elif [ "$out" = "has no A record" ]
+        a_record_exist=1
+        log_info "A record not exists"
     fi
+    return $a_record_exist
 }
 
-get_domain_realm()
-{
+get_domain_realm() {
     DOMAIN_REALM="$(upper "$(dnsdomainname)")"
 
     #"$(net ads info | grep Realm | awk 'NF>1{print $NF}')" || \
     #                                          (echo "$DOMAIN_REALM" && exit 1)
 }
 
-get_host_name()
-{
+get_host_name() {
     FQDN_NAME="$(hostname -f)"
     UPPER_HOST_NAME="$(upper "$(hostname -s)")"
 }
 
-get_connection_iface_to_ldap()
-{   
+get_connection_iface_to_ldap() {
     # Get actual dc connection ip
     dc="$(wbinfo -P | awk -F\" '{print $2}')"
     dc_ip="$(host "$dc" | awk -F' ' '{print $NF}')"
@@ -82,18 +113,15 @@ get_connection_iface_to_ldap()
     connect_iface="$(ip route get dport 389 "$dc_ip" | awk -F'dev ' '{print $2;exit}' | awk '{print $1}')" 
 }
 
-get_old_ptr_record()
-{
+get_old_ptr_record() {
     old_ptr_ipv4_record="$(host $1 | awk '{print $1}')"
 }
 
-get_old_ip_addr()
-{   
+get_old_ip_addr() {
     old_ipv4_ip="$(host $1 | awk '{print $4}')"
 }
 
-get_iface_addr()
-{   
+get_iface_addr() {
     local iface=$1
     ipv4_addr=" $(ip addr list "$iface" | \
                                      awk '/inet/ {print $2}' | \
@@ -101,24 +129,25 @@ get_iface_addr()
                                      grep -o "[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*")"
 }
 
-generate_ptr_ip()
-{    
+generate_ptr_ip() {
     IFS=. read ip1 ip2 ip3 ip4 <<< "$1"
     ptr_ipv4_addr="$ip4"."$ip3"."$ip2"."$ip1".in-addr.arpa.
 }
 
-nsupdate_forward_zone_command()
-{   
-    printf "update delete "$FQDN_NAME" in A\nupdate add "$FQDN_NAME" "$TTL" A "$1"\nsend\nquit" | nsupdate -g || return 1
+nsupdate_forward_zone_command() {
+    cat << EOF | nsupdate -g || return 1
+        update delete $FQDN_NAME in A
+        update add $FQDN_NAME $TTL A $1
+        send
+        quit
+EOF
 }
 
-nsupdate_reverse_zone_command()
-{   
+nsupdate_reverse_zone_command() {
     printf "update delete $2 PTR\nupdate add "$1" "$TTL" PTR "$FQDN_NAME"\nsend\nquit" | nsupdate -g || return 1
 }
 
-update_reverse_zone()
-{   
+update_reverse_zone() {
     # Remove old PTR record if exist
     res=0
     generate_ptr_ip $ipv4_addr
@@ -142,8 +171,7 @@ update_reverse_zone()
     fi
 }
 
-update_forward_zone()
-{
+update_forward_zone() {
     res=0
     nsupdate_forward_zone_command $ipv4_addr || res=1
     if [[ $res == 0 ]]; then
@@ -156,8 +184,7 @@ update_forward_zone()
     fi
 }
 
-main()
-{   
+main() {
     # Init vars
     check_req
     get_domain_realm
@@ -171,7 +198,7 @@ main()
 
     #Reverse zone update if PTR_UPDATE is 1
     if [[ $PTR_UPDATE == 1 ]]; then
-        check_exist_forward_record "$FQDN_NAME"
+        check_exist_a_record "$FQDN_NAME"
         if [[ $forward_record_exist == 1 ]]; then
             update_reverse_zone
             update_forward_zone
