@@ -77,14 +77,15 @@ host_kinit() {
     upper_host_name="$( upper "$1" )"
 
     result="$(kinit -k "$upper_host_name"\$@"$domain_realm" 2>&1)" || \
-(log_error "kinit error. You should check the availability of the KDC and whether the host is a member of the domain" && \
-log_error "$result" && return 1)
+        (log_error "kinit error. You should check the availability of the KDC and whether the host is a member of the domain" && \
+        log_error "$result" && return 1)
 }
 
 check_dns_servers_reacheble() {
     local host_name="$1"
-    out="$(host -t a "$host_name" 2>&1)"
-    if [ $? -eq 0 ] || grep -q "NXDOMAIN" <<< "$out"; then
+    local ret=0
+    out="$(host -t a "$host_name" 2>&1)" || ret=$?
+    if [ $ret -eq 0 ] || grep -q "NXDOMAIN" <<< "$out"; then
         return 0
     elif grep -q "no servers could be reached" <<< "$out"; then
         log_error "DNS server not responding"
@@ -147,23 +148,101 @@ get_short_hostname() {
     echo "$upper_hostname"
 }
 
-get_connection_iface_to_ldap() {
+validate_hostname() {
+    local hostname="$1"
+    local validate_regex=
+    local ret=0
+    validate_regex="^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$"
+    grep -E "$validate_regex" >/dev/null 2>&1 <<< $hostname || ret=1
+    return $ret
+}
+
+validate_ipv4() {
+    local ipv4="$1"
+    local validate_regex=
+    local ret=0
+    validate_regex="^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$"
+    grep -E "$validate_regex" >/dev/null 2>&1 <<< $ipv4 || ret=1
+    return $ret
+}
+
+get_dc_hostname() {
     local dc=
+    local out=
+    local ret=1
+    if out="$(wbinfo -P)"; then
+        if dc="$(awk -F\" 'NR==1 {print $2}' 2>&1 <<< $out)"; then
+            if validate_hostname "$dc"; then
+                echo -n "$dc" && ret=0
+            else
+                log_warning "Domain controller hostname invalid: $dc"
+            fi
+        else
+            log_warning "Can not parse domain controller hostname"
+            log_warning "AWK errror: $dc"
+        fi
+    else
+        log_warning "Wbinfo error:"
+        log_warning "$out"
+    fi
+    return $ret
+}
+
+get_ip_from_hostname() {
+    local hostname="$1"
+    local out=
+    local ip=
+    local ret=1
+    if validate_hostname "$hostname"; then
+        if out="$(host -t a "$hostname")"; then
+            if ip="$(awk -F' ' '{print $NF}' 2>&1 <<< $out)"; then
+                if validate_ipv4 "$ip"; then
+                    echo -n "$ip" && ret=0
+                else
+                    log_warning "Invalid IPv4 address: $ip"
+                fi
+            else
+                log_warning "Can not parse IPv4 address"
+                log_warning "AWK errror: $ip"
+            fi
+        else
+            log_warning "Can not resolve hostname: $hostname"
+            log_warning "DNS error: $out"
+        fi
+    else
+        log_warning "Invalid hostname: $hostname"
+    fi
+    return $ret
+}
+
+get_connection_iface_to_ldap() {
+    local dc_hostname=
     local dc_ip=
     local connect_iface=
+    local out=
+    local ret=1
+
     # Get actual dc connection ip
-    dc="$(wbinfo -P | awk -F\" '{print $2}')"
-    dc_ip="$(host "$dc" | awk -F' ' '{print $NF}')"
+    if dc_hostname="$(get_dc_hostname)"; then
+        if ! dc_ip="$(get_ip_from_hostname $dc_hostname)"; then
+            log_warning "Can not resolve domain controller address for $dc_hostname"
+        fi
+    else
+        log_warning "Can not get domain controller hostname"
+    fi
 
     # Find iface
-    connect_iface="$(ip route get dport 389 "$dc_ip" | awk -F'dev ' '{print $2;exit}' | awk '{print $1}')"
-
-    if [ -z "$connect_iface" ]; then
-        log_error "Can't find connection intarface."
-        return 1
+    if out="$(ip route get dport 389 "$dc_ip")"; then
+        if connect_iface="$(awk -F'dev ' 'NR==1 {print $2}' <<< $out | awk '{print $1}' 2>&1)"; then
+            echo -n "$connect_iface" && ret=0
+        else
+            log_warning "Can not parse connection interface"
+            log_warning "AWK errror: $connect_iface"
+        fi
     else
-        echo "$connect_iface"
+        log_warning "Ip route error: $out"
     fi
+    return $ret
 }
 
 get_old_ipv4_addr() {
@@ -173,7 +252,7 @@ get_old_ipv4_addr() {
     old_ipv4_ip="$(host -t a "$hostname" | awk '{print $4}')" || ret=1
 
     if [ $ret -eq 1 ]; then
-        log_error "Can't get old ip addres."
+        log_error "Can't get old ip address."
         return 1
     else
         echo "$old_ipv4_ip"
@@ -185,9 +264,9 @@ get_old_ptr_record() {
     local ret=0
     local old_ptr_record=
 
-    old_ptr_record="$(host -t a "$1" | awk '{print $1}')" || ret=1
+    old_ptr_record="$(host -t ptr "$1" | awk '{print $1}')" || ret=1
     if [ $ret -eq 1 ]; then
-        log_error "Can't get old PTR addres."
+        log_error "Can't get old PTR address."
         return 1
     else
         echo "$old_ptr_record"
@@ -204,10 +283,10 @@ get_iface_ipv4_addr() {
                                      cut -d/ -f1 | \
                                      grep -o "[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*")" || ret=1
     if [ $ret -eq 1 ]; then
-        log_error "Can't get current ip addres."
+        log_error "Can't get current ip address."
         return 1
     else
-        echo $ipv4_addr
+        echo -n "$ipv4_addr"
     fi
 }
 
@@ -384,7 +463,10 @@ main() {
         host_kinit "$upper_hostname" "$domain_realm"
 
         # Get the interface through which the connection is established with ldаp
-        connect_iface="$(get_connection_iface_to_ldap)" 
+        if ! connect_iface="$(get_connection_iface_to_ldap)"; then
+            log_error "Can not get client to domain controller connection interface"
+            return 1
+        fi
         ipv4_addr="$(get_iface_ipv4_addr "$connect_iface")"
 
         check_exist_ptr_record "$ipv4_addr" || exist_ptr_record=1
